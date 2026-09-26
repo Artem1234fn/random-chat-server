@@ -1,5 +1,5 @@
 /**
- * Сервер случайного чата с системой друзей.
+ * Сервер случайного чата с друзьями, жалобами и банами.
  *
  * Установка:
  *   npm init -y
@@ -8,31 +8,34 @@
  * Запуск:
  *   node server.js
  *
- * ВАЖНО: список пользователей/друзей хранится в файле data.json рядом
- * с сервером. На бесплатных хостингах диск может очищаться при
- * каждом новом деплое (обновлении кода) — тогда список друзей сбросится.
- * Это не баг, а ограничение бесплатного тарифа.
+ * ВАЖНО (безопасность): пароль администратора берётся из переменной
+ * окружения ADMIN_PASSWORD. Задай её в панели хостинга (Render:
+ * Environment -> Add Environment Variable), НЕ пиши пароль прямо
+ * в этом файле — репозиторий публичный, его увидит кто угодно.
+ * Если переменная не задана, админ-панель отключена.
  *
- * Протокол (JSON-сообщения):
+ * ВАЖНО (диск): все данные (пользователи, друзья, жалобы, баны)
+ * хранятся в data.json рядом с сервером. На бесплатных хостингах
+ * диск может очищаться при каждом новом деплое кода — тогда всё
+ * обнулится. Для настоящей надёжности в будущем нужна база данных.
+ *
+ * Протокол (WebSocket, JSON-сообщения):
  *
  * Клиент -> Сервер:
- *   { type: "register", username, token, nick, avatar }
- *     — войти под юзернеймом. token пустой при первой регистрации,
- *       дальше сервер выдаёт постоянный token, который клиент обязан
- *       сохранить и присылать при каждом следующем входе под тем же
- *       username (это доказывает, что аккаунт "твой").
- *   { type: "join" }                     — встать в очередь случайного чата
- *   { type: "message", text }            — отправить сообщение партнёру
- *   { type: "skip" }                     — пропустить текущего собеседника
- *   { type: "friend_request" }           — отправить заявку в друзья текущему партнёру
+ *   { type: "register", username, token, nick, avatar, deviceId }
+ *   { type: "join" }
+ *   { type: "message", text }
+ *   { type: "skip" }
+ *   { type: "friend_request" }
  *   { type: "friend_response", from_username, accept }
- *                                         — ответ на входящую заявку
- *   { type: "get_friends" }              — запросить список друзей
- *   { type: "direct_connect", username } — написать конкретному другу напрямую
+ *   { type: "get_friends" }
+ *   { type: "direct_connect", username }
+ *   { type: "report", reason }            — пожаловаться на текущего партнёра
  *
  * Сервер -> Клиент:
  *   { type: "registered", username, token }
  *   { type: "username_taken" }
+ *   { type: "banned", reason }
  *   { type: "waiting" }
  *   { type: "matched", partner_nick, partner_avatar, partner_username, already_friends }
  *   { type: "message", text }
@@ -40,30 +43,39 @@
  *   { type: "friend_request_received", from_username, from_nick, from_avatar }
  *   { type: "friend_added", username, nick, avatar }
  *   { type: "friend_declined" }
- *   { type: "friends_list", friends: [{username, nick, avatar, online}] }
+ *   { type: "friends_list", friends: [...] }
  *   { type: "friend_offline", username }
  *   { type: "friend_busy", username }
+ *   { type: "report_sent" }
  *   { type: "error", message }
+ *
+ * Админ-панель (обычный HTTP, отдельно от WebSocket, тот же адрес и порт):
+ *   GET  /admin/reports?password=...                       -> список жалоб
+ *   POST /admin/ban      { password, username, alsoBanIp }  -> забанить
+ *   POST /admin/resolve  { password, reportId }             -> отклонить жалобу без бана
  */
 
 const WebSocket = require("ws");
+const http = require("http");
 const fs = require("fs");
 const path = require("path");
 
 const PORT = process.env.PORT || 8080;
-const wss = new WebSocket.Server({ port: PORT });
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || null;
 
-const MAX_AVATAR_LENGTH = 300000; // ~300 KB строки base64
+const MAX_AVATAR_LENGTH = 300000;
+const MAX_REPORT_REASON_LENGTH = 500;
 const DATA_FILE = path.join(__dirname, "data.json");
 
-// Постоянные данные: { [username]: { token, nick, avatar, friends: [username...] } }
-let usersData = {};
+// ---------- постоянное хранилище ----------
+let db = { users: {}, reports: [], bannedUsernames: {}, bannedIps: {}, bannedDeviceIds: {} };
 
 function loadData() {
   try {
-    usersData = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+    const raw = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+    db = Object.assign({ users: {}, reports: [], bannedUsernames: {}, bannedIps: {}, bannedDeviceIds: {} }, raw);
   } catch (e) {
-    usersData = {};
+    // файла ещё нет или он битый — начинаем с чистого листа
   }
 }
 loadData();
@@ -75,7 +87,7 @@ function saveData() {
   setTimeout(() => {
     saveScheduled = false;
     try {
-      fs.writeFileSync(DATA_FILE, JSON.stringify(usersData));
+      fs.writeFileSync(DATA_FILE, JSON.stringify(db));
     } catch (e) {
       console.error("Не удалось сохранить data.json:", e.message);
     }
@@ -85,28 +97,116 @@ function saveData() {
 function randomToken() {
   return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
 }
+function randomId() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
 
-// Очередь клиентов, ожидающих случайного собеседника
+function getClientIp(req) {
+  const fwd = req.headers["x-forwarded-for"];
+  if (fwd) return fwd.split(",")[0].trim();
+  return req.socket.remoteAddress || "";
+}
+
+// ---------- HTTP-сервер (обычные запросы + админ-панель) ----------
+function readJsonBody(req) {
+  return new Promise((resolve) => {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      try { resolve(JSON.parse(body || "{}")); } catch (e) { resolve({}); }
+    });
+  });
+}
+
+function sendJson(res, status, obj) {
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+  });
+  res.end(JSON.stringify(obj));
+}
+
+const httpServer = http.createServer(async (req, res) => {
+  const url = new URL(req.url, "http://localhost");
+
+  if (req.method === "OPTIONS") {
+    return sendJson(res, 200, {});
+  }
+
+  if (!ADMIN_PASSWORD) {
+    return sendJson(res, 503, { error: "Админ-панель отключена: не задан ADMIN_PASSWORD" });
+  }
+
+  if (url.pathname === "/admin/reports" && req.method === "GET") {
+    if (url.searchParams.get("password") !== ADMIN_PASSWORD) {
+      return sendJson(res, 401, { error: "Неверный пароль" });
+    }
+    const reports = db.reports
+      .slice()
+      .sort((a, b) => b.createdAt - a.createdAt);
+    return sendJson(res, 200, { reports });
+  }
+
+  if (url.pathname === "/admin/ban" && req.method === "POST") {
+    const body = await readJsonBody(req);
+    if (body.password !== ADMIN_PASSWORD) return sendJson(res, 401, { error: "Неверный пароль" });
+
+    const username = (body.username || "").toString();
+    if (!username || !db.users[username]) return sendJson(res, 404, { error: "Пользователь не найден" });
+
+    db.bannedUsernames[username] = true;
+
+    if (body.alsoBanIp && db.users[username].lastIp) {
+      db.bannedIps[db.users[username].lastIp] = true;
+    }
+    if (body.alsoBanDevice && db.users[username].lastDeviceId) {
+      db.bannedDeviceIds[db.users[username].lastDeviceId] = true;
+    }
+    saveData();
+
+    const targetWs = onlineSockets.get(username);
+    if (targetWs) {
+      send(targetWs, { type: "banned", reason: "Тебя забанили за нарушение правил" });
+      targetWs.close();
+    }
+    return sendJson(res, 200, { ok: true });
+  }
+
+  if (url.pathname === "/admin/resolve" && req.method === "POST") {
+    const body = await readJsonBody(req);
+    if (body.password !== ADMIN_PASSWORD) return sendJson(res, 401, { error: "Неверный пароль" });
+
+    const reportId = (body.reportId || "").toString();
+    const report = db.reports.find((r) => r.id === reportId);
+    if (report) {
+      report.resolved = true;
+      saveData();
+    }
+    return sendJson(res, 200, { ok: true });
+  }
+
+  sendJson(res, 404, { error: "Не найдено" });
+});
+
+const wss = new WebSocket.Server({ server: httpServer });
+
+// ---------- рантайм-состояние (не сохраняется на диск) ----------
 let queue = [];
-
-// ws -> { username, nick, avatar, partner (ws|null) }
-const clients = new Map();
-
-// username -> ws (кто сейчас онлайн)
-const onlineSockets = new Map();
+const clients = new Map();       // ws -> { username, nick, avatar, partner, ip }
+const onlineSockets = new Map(); // username -> ws
 
 function send(ws, obj) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(obj));
   }
 }
-
 function removeFromQueue(ws) {
   queue = queue.filter((c) => c !== ws);
 }
-
 function publicProfile(username) {
-  const u = usersData[username];
+  const u = db.users[username];
   if (!u) return null;
   return { username, nick: u.nick, avatar: u.avatar };
 }
@@ -120,35 +220,17 @@ function pairUp(wsA, wsB) {
   b.partner = wsA;
 
   const areFriends =
-    a.username &&
-    b.username &&
-    usersData[a.username] &&
-    usersData[a.username].friends.includes(b.username);
+    a.username && b.username && db.users[a.username] && db.users[a.username].friends.includes(b.username);
 
-  send(wsA, {
-    type: "matched",
-    partner_nick: b.nick,
-    partner_avatar: b.avatar,
-    partner_username: b.username,
-    already_friends: !!areFriends,
-  });
-  send(wsB, {
-    type: "matched",
-    partner_nick: a.nick,
-    partner_avatar: a.avatar,
-    partner_username: a.username,
-    already_friends: !!areFriends,
-  });
+  send(wsA, { type: "matched", partner_nick: b.nick, partner_avatar: b.avatar, partner_username: b.username, already_friends: !!areFriends });
+  send(wsB, { type: "matched", partner_nick: a.nick, partner_avatar: a.avatar, partner_username: a.username, already_friends: !!areFriends });
 }
 
 function findPartner(ws) {
   removeFromQueue(ws);
-
   if (queue.length > 0) {
     const partner = queue.shift();
-    if (partner.readyState !== WebSocket.OPEN) {
-      return findPartner(ws);
-    }
+    if (partner.readyState !== WebSocket.OPEN) return findPartner(ws);
     pairUp(ws, partner);
   } else {
     queue.push(ws);
@@ -169,22 +251,23 @@ function breakPair(ws, { requeueSelf = false } = {}) {
     send(partnerWs, { type: "partner_left" });
     findPartner(partnerWs);
   }
-
-  if (requeueSelf) {
-    findPartner(ws);
-  }
+  if (requeueSelf) findPartner(ws);
 }
 
-wss.on("connection", (ws) => {
-  clients.set(ws, { username: null, nick: "Аноним", avatar: null, partner: null });
+wss.on("connection", (ws, req) => {
+  const ip = getClientIp(req);
+
+  if (db.bannedIps[ip]) {
+    send(ws, { type: "banned", reason: "Доступ заблокирован" });
+    ws.close();
+    return;
+  }
+
+  clients.set(ws, { username: null, nick: "Аноним", avatar: null, partner: null, ip, deviceId: null });
 
   ws.on("message", (raw) => {
     let data;
-    try {
-      data = JSON.parse(raw);
-    } catch (e) {
-      return send(ws, { type: "error", message: "Некорректный JSON" });
-    }
+    try { data = JSON.parse(raw); } catch (e) { return send(ws, { type: "error", message: "Некорректный JSON" }); }
 
     const me = clients.get(ws);
     if (!me) return;
@@ -194,73 +277,66 @@ wss.on("connection", (ws) => {
         const username = (data.username || "").toString().trim().slice(0, 24);
         const token = (data.token || "").toString();
         const nick = (data.nick || "Аноним").toString().slice(0, 24);
+        const deviceId = (data.deviceId || "").toString().slice(0, 100);
         let avatar = null;
-        if (
-          typeof data.avatar === "string" &&
-          data.avatar.length > 0 &&
-          data.avatar.length <= MAX_AVATAR_LENGTH
-        ) {
+        if (typeof data.avatar === "string" && data.avatar.length > 0 && data.avatar.length <= MAX_AVATAR_LENGTH) {
           avatar = data.avatar;
         }
 
-        if (!username) {
-          return send(ws, { type: "error", message: "Укажи юзернейм" });
+        if (!username) return send(ws, { type: "error", message: "Укажи юзернейм" });
+
+        if (db.bannedUsernames[username]) {
+          send(ws, { type: "banned", reason: "Этот аккаунт заблокирован за нарушение правил" });
+          return ws.close();
+        }
+        if (deviceId && db.bannedDeviceIds[deviceId]) {
+          send(ws, { type: "banned", reason: "Это устройство заблокировано за нарушение правил" });
+          return ws.close();
         }
 
-        const existing = usersData[username];
-
+        const existing = db.users[username];
         if (existing) {
           if (!token || existing.token !== token) {
             return send(ws, { type: "username_taken" });
           }
           existing.nick = nick;
           existing.avatar = avatar;
+          existing.lastIp = ip;
+          if (deviceId) existing.lastDeviceId = deviceId;
         } else {
-          usersData[username] = {
-            token: token || randomToken(),
-            nick,
-            avatar,
-            friends: [],
-          };
+          db.users[username] = { token: token || randomToken(), nick, avatar, friends: [], lastIp: ip, lastDeviceId: deviceId || null };
         }
         saveData();
 
         me.username = username;
         me.nick = nick;
         me.avatar = avatar;
+        me.deviceId = deviceId;
         onlineSockets.set(username, ws);
 
-        send(ws, { type: "registered", username, token: usersData[username].token });
+        send(ws, { type: "registered", username, token: db.users[username].token });
         break;
       }
 
-      case "join": {
+      case "join":
         findPartner(ws);
         break;
-      }
 
-      case "message": {
+      case "message":
         if (me.partner && clients.has(me.partner)) {
           send(me.partner, { type: "message", text: String(data.text || "") });
         }
         break;
-      }
 
-      case "skip": {
+      case "skip":
         breakPair(ws, { requeueSelf: true });
         break;
-      }
 
       case "friend_request": {
         if (!me.username || !me.partner) break;
         const partner = clients.get(me.partner);
         if (!partner || !partner.username) break;
-        send(me.partner, {
-          type: "friend_request_received",
-          from_username: me.username,
-          from_nick: me.nick,
-          from_avatar: me.avatar,
-        });
+        send(me.partner, { type: "friend_request_received", from_username: me.username, from_nick: me.nick, from_avatar: me.avatar });
         break;
       }
 
@@ -269,33 +345,13 @@ wss.on("connection", (ws) => {
         const accept = !!data.accept;
         const fromWs = onlineSockets.get(fromUsername);
 
-        if (
-          accept &&
-          me.username &&
-          fromUsername &&
-          usersData[me.username] &&
-          usersData[fromUsername]
-        ) {
-          if (!usersData[me.username].friends.includes(fromUsername)) {
-            usersData[me.username].friends.push(fromUsername);
-          }
-          if (!usersData[fromUsername].friends.includes(me.username)) {
-            usersData[fromUsername].friends.push(me.username);
-          }
+        if (accept && me.username && fromUsername && db.users[me.username] && db.users[fromUsername]) {
+          if (!db.users[me.username].friends.includes(fromUsername)) db.users[me.username].friends.push(fromUsername);
+          if (!db.users[fromUsername].friends.includes(me.username)) db.users[fromUsername].friends.push(me.username);
           saveData();
 
-          send(ws, {
-            type: "friend_added",
-            username: fromUsername,
-            nick: usersData[fromUsername].nick,
-            avatar: usersData[fromUsername].avatar,
-          });
-          send(fromWs, {
-            type: "friend_added",
-            username: me.username,
-            nick: usersData[me.username].nick,
-            avatar: usersData[me.username].avatar,
-          });
+          send(ws, { type: "friend_added", username: fromUsername, nick: db.users[fromUsername].nick, avatar: db.users[fromUsername].avatar });
+          send(fromWs, { type: "friend_added", username: me.username, nick: db.users[me.username].nick, avatar: db.users[me.username].avatar });
         } else {
           send(fromWs, { type: "friend_declined" });
         }
@@ -303,17 +359,10 @@ wss.on("connection", (ws) => {
       }
 
       case "get_friends": {
-        if (!me.username || !usersData[me.username]) {
-          return send(ws, { type: "friends_list", friends: [] });
-        }
-        const list = usersData[me.username].friends.map((u) => {
+        if (!me.username || !db.users[me.username]) return send(ws, { type: "friends_list", friends: [] });
+        const list = db.users[me.username].friends.map((u) => {
           const profile = publicProfile(u);
-          return {
-            username: u,
-            nick: profile ? profile.nick : u,
-            avatar: profile ? profile.avatar : null,
-            online: onlineSockets.has(u),
-          };
+          return { username: u, nick: profile ? profile.nick : u, avatar: profile ? profile.avatar : null, online: onlineSockets.has(u) };
         });
         send(ws, { type: "friends_list", friends: list });
         break;
@@ -322,21 +371,38 @@ wss.on("connection", (ws) => {
       case "direct_connect": {
         const targetUsername = (data.username || "").toString();
         const targetWs = onlineSockets.get(targetUsername);
-
-        if (!targetWs || targetWs.readyState !== WebSocket.OPEN) {
-          return send(ws, { type: "friend_offline", username: targetUsername });
-        }
+        if (!targetWs || targetWs.readyState !== WebSocket.OPEN) return send(ws, { type: "friend_offline", username: targetUsername });
 
         const targetMeta = clients.get(targetWs);
-        if (targetMeta.partner) {
-          return send(ws, { type: "friend_busy", username: targetUsername });
-        }
+        if (targetMeta.partner) return send(ws, { type: "friend_busy", username: targetUsername });
 
         breakPair(ws, { requeueSelf: false });
         removeFromQueue(ws);
         removeFromQueue(targetWs);
-
         pairUp(ws, targetWs);
+        break;
+      }
+
+      case "report": {
+        if (!me.partner || !clients.has(me.partner)) break;
+        const partner = clients.get(me.partner);
+        const reason = (data.reason || "").toString().trim().slice(0, MAX_REPORT_REASON_LENGTH);
+        if (!reason) break;
+
+        db.reports.push({
+          id: randomId(),
+          reporterUsername: me.username || "(без юзернейма)",
+          reporterNick: me.nick,
+          reportedUsername: partner.username || "(без юзернейма)",
+          reportedNick: partner.nick,
+          reportedIp: partner.ip,
+          reportedDeviceId: partner.deviceId || null,
+          reason,
+          createdAt: Date.now(),
+          resolved: false,
+        });
+        saveData();
+        send(ws, { type: "report_sent" });
         break;
       }
 
@@ -356,4 +422,7 @@ wss.on("connection", (ws) => {
   });
 });
 
-console.log(`Сервер случайного чата с друзьями запущен на порту ${PORT}`);
+httpServer.listen(PORT, () => {
+  console.log(`Сервер случайного чата с друзьями/жалобами запущен на порту ${PORT}`);
+  console.log(ADMIN_PASSWORD ? "Админ-панель включена." : "Админ-панель ОТКЛЮЧЕНА (нет ADMIN_PASSWORD).");
+});
