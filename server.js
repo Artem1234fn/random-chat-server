@@ -11,17 +11,20 @@
  * Протокол (JSON-сообщения):
  *
  * Клиент -> Сервер:
- *   { type: "join", nick: "Имя" }      — войти и встать в поиск
- *   { type: "message", text: "..." }   — отправить сообщение партнёру
- *   { type: "skip" }                   — пропустить текущего собеседника
+ *   { type: "join", nick: "Имя", avatar: "data:image/..." }  — войти и встать в поиск (avatar опционален)
+ *   { type: "message", text: "..." }                          — отправить сообщение партнёру
+ *   { type: "skip" }                                          — пропустить текущего собеседника
  *
  * Сервер -> Клиент:
- *   { type: "waiting" }                                — ищем тебе собеседника
- *   { type: "matched", partner_nick: "..." }            — собеседник найден
- *   { type: "message", text: "..." }                    — сообщение от партнёра
- *   { type: "partner_left" }                             — партнёр отключился/скипнул
+ *   { type: "waiting" }                                                          — ищем тебе собеседника
+ *   { type: "matched", partner_nick: "...", partner_avatar: "..." | null }        — собеседник найден
+ *   { type: "message", text: "..." }                                             — сообщение от партнёра
+ *   { type: "partner_left" }                                                     — партнёр отключился/скипнул
  *   { type: "error", message: "..." }
  */
+
+// Ограничение на размер аватарки (data URL), чтобы не гонять огромные файлы
+const MAX_AVATAR_LENGTH = 300000; // ~300 KB строки base64
 
 const WebSocket = require("ws");
 
@@ -62,8 +65,8 @@ function findPartner(ws) {
     me.partner = partner;
     other.partner = ws;
 
-    send(ws, { type: "matched", partner_nick: other.nick });
-    send(partner, { type: "matched", partner_nick: me.nick });
+    send(ws, { type: "matched", partner_nick: other.nick, partner_avatar: other.avatar });
+    send(partner, { type: "matched", partner_nick: me.nick, partner_avatar: me.avatar });
   } else {
     queue.push(ws);
     send(ws, { type: "waiting" });
@@ -92,7 +95,7 @@ function breakPair(ws, { requeueSelf = false } = {}) {
 }
 
 wss.on("connection", (ws) => {
-  clients.set(ws, { nick: "Аноним", partner: null });
+  clients.set(ws, { nick: "Аноним", avatar: null, partner: null });
 
   ws.on("message", (raw) => {
     let data;
@@ -108,6 +111,13 @@ wss.on("connection", (ws) => {
     switch (data.type) {
       case "join": {
         me.nick = (data.nick || "Аноним").toString().slice(0, 24);
+
+        if (typeof data.avatar === "string" && data.avatar.length > 0) {
+          me.avatar = data.avatar.length <= MAX_AVATAR_LENGTH ? data.avatar : null;
+        } else {
+          me.avatar = null;
+        }
+
         findPartner(ws);
         break;
       }
