@@ -14,10 +14,12 @@
  * в этом файле — репозиторий публичный, его увидит кто угодно.
  * Если переменная не задана, админ-панель отключена.
  *
- * ВАЖНО (диск): все данные (пользователи, друзья, жалобы, баны)
- * хранятся в data.json рядом с сервером. На бесплатных хостингах
- * диск может очищаться при каждом новом деплое кода — тогда всё
- * обнулится. Для настоящей надёжности в будущем нужна база данных.
+ * ВАЖНО (хранилище): если задана переменная окружения MONGODB_URI —
+ * все данные (пользователи, друзья, жалобы, баны) хранятся в MongoDB
+ * Atlas и переживают любой передеплой кода. Если MONGODB_URI не задана,
+ * сервер работает по-старому — хранит всё в файле data.json рядом
+ * с собой (годится для локальных тестов, но на бесплатном хостинге
+ * такой файл может обнуляться при каждом обновлении кода).
  *
  * Протокол (WebSocket, JSON-сообщения):
  *
@@ -53,43 +55,74 @@
  *   GET  /admin/reports?password=...                       -> список жалоб
  *   POST /admin/ban      { password, username, alsoBanIp }  -> забанить
  *   POST /admin/resolve  { password, reportId }             -> отклонить жалобу без бана
+ *   GET  /admin/banned?password=...                         -> список забаненных
+ *   POST /admin/unban    { password, username }             -> разбанить
  */
 
 const WebSocket = require("ws");
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
+const { MongoClient } = require("mongodb");
 
 const PORT = process.env.PORT || 8080;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || null;
+const MONGODB_URI = process.env.MONGODB_URI || null;
 
 const MAX_AVATAR_LENGTH = 300000;
 const MAX_REPORT_REASON_LENGTH = 500;
 const DATA_FILE = path.join(__dirname, "data.json");
 
-// ---------- постоянное хранилище ----------
-let db = { users: {}, reports: [], bannedUsernames: {}, bannedIps: {}, bannedDeviceIds: {} };
+const EMPTY_DB = { users: {}, reports: [], bannedUsernames: {}, bannedIps: {}, bannedDeviceIds: {} };
 
-function loadData() {
+// ---------- постоянное хранилище ----------
+let db = Object.assign({}, EMPTY_DB);
+
+let mongoCollection = null; // задаётся в initStorage(), если есть MONGODB_URI
+
+async function initStorage() {
+  if (MONGODB_URI) {
+    const client = new MongoClient(MONGODB_URI);
+    await client.connect();
+    mongoCollection = client.db("randomchat").collection("state");
+
+    const doc = await mongoCollection.findOne({ _id: "main" });
+    if (doc) {
+      delete doc._id;
+      db = Object.assign({}, EMPTY_DB, doc);
+    } else {
+      await mongoCollection.insertOne(Object.assign({ _id: "main" }, db));
+    }
+    console.log("Хранилище: MongoDB (данные переживут передеплой).");
+  } else {
+    loadDataFromFile();
+    console.log("Хранилище: локальный файл data.json (MONGODB_URI не задана).");
+  }
+}
+
+function loadDataFromFile() {
   try {
     const raw = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
-    db = Object.assign({ users: {}, reports: [], bannedUsernames: {}, bannedIps: {}, bannedDeviceIds: {} }, raw);
+    db = Object.assign({}, EMPTY_DB, raw);
   } catch (e) {
     // файла ещё нет или он битый — начинаем с чистого листа
   }
 }
-loadData();
 
 let saveScheduled = false;
 function saveData() {
   if (saveScheduled) return;
   saveScheduled = true;
-  setTimeout(() => {
+  setTimeout(async () => {
     saveScheduled = false;
     try {
-      fs.writeFileSync(DATA_FILE, JSON.stringify(db));
+      if (mongoCollection) {
+        await mongoCollection.updateOne({ _id: "main" }, { $set: db }, { upsert: true });
+      } else {
+        fs.writeFileSync(DATA_FILE, JSON.stringify(db));
+      }
     } catch (e) {
-      console.error("Не удалось сохранить data.json:", e.message);
+      console.error("Не удалось сохранить данные:", e.message);
     }
   }, 300);
 }
@@ -455,7 +488,15 @@ wss.on("connection", (ws, req) => {
   });
 });
 
-httpServer.listen(PORT, () => {
-  console.log(`Сервер случайного чата с друзьями/жалобами запущен на порту ${PORT}`);
-  console.log(ADMIN_PASSWORD ? "Админ-панель включена." : "Админ-панель ОТКЛЮЧЕНА (нет ADMIN_PASSWORD).");
+async function start() {
+  await initStorage();
+  httpServer.listen(PORT, () => {
+    console.log(`Сервер случайного чата с друзьями/жалобами запущен на порту ${PORT}`);
+    console.log(ADMIN_PASSWORD ? "Админ-панель включена." : "Админ-панель ОТКЛЮЧЕНА (нет ADMIN_PASSWORD).");
+  });
+}
+
+start().catch((err) => {
+  console.error("Не удалось запустить сервер:", err.message);
+  process.exit(1);
 });
