@@ -187,6 +187,39 @@ const httpServer = http.createServer(async (req, res) => {
     return sendJson(res, 200, { ok: true });
   }
 
+  if (url.pathname === "/admin/banned" && req.method === "GET") {
+    if (url.searchParams.get("password") !== ADMIN_PASSWORD) {
+      return sendJson(res, 401, { error: "Неверный пароль" });
+    }
+    const banned = Object.keys(db.bannedUsernames).map((username) => {
+      const profile = db.users[username];
+      return {
+        username,
+        nick: profile ? profile.nick : username,
+        avatar: profile ? profile.avatar : null,
+      };
+    });
+    return sendJson(res, 200, { banned });
+  }
+
+  if (url.pathname === "/admin/unban" && req.method === "POST") {
+    const body = await readJsonBody(req);
+    if (body.password !== ADMIN_PASSWORD) return sendJson(res, 401, { error: "Неверный пароль" });
+
+    const username = (body.username || "").toString();
+    if (!username) return sendJson(res, 404, { error: "Пользователь не найден" });
+
+    delete db.bannedUsernames[username];
+
+    const profile = db.users[username];
+    if (profile) {
+      if (profile.lastIp) delete db.bannedIps[profile.lastIp];
+      if (profile.lastDeviceId) delete db.bannedDeviceIds[profile.lastDeviceId];
+    }
+    saveData();
+    return sendJson(res, 200, { ok: true });
+  }
+
   sendJson(res, 404, { error: "Не найдено" });
 });
 
