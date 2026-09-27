@@ -24,7 +24,7 @@
  * Протокол (WebSocket, JSON-сообщения):
  *
  * Клиент -> Сервер:
- *   { type: "register", username, token, nick, avatar, deviceId }
+ *   { type: "register", username, token, nick, avatar, banner, bio, deviceId }
  *   { type: "join" }
  *   { type: "message", text }
  *   { type: "skip" }
@@ -32,14 +32,16 @@
  *   { type: "friend_response", from_username, accept }
  *   { type: "get_friends" }
  *   { type: "direct_connect", username }
- *   { type: "report", reason }            — пожаловаться на текущего партнёра
+ *   { type: "report", reason, username }     — жалоба; username опционален (по умолчанию — текущий партнёр)
+ *   { type: "get_profile", username }        — открыть чей-то профиль
+ *   { type: "block_user", username }         — заблокировать пользователя (не будет попадаться в чате/заявках)
  *
  * Сервер -> Клиент:
  *   { type: "registered", username, token }
  *   { type: "username_taken" }
  *   { type: "banned", reason }
  *   { type: "waiting" }
- *   { type: "matched", partner_nick, partner_avatar, partner_username, already_friends }
+ *   { type: "matched", partner_nick, partner_avatar, partner_banner, partner_username, already_friends }
  *   { type: "message", text }
  *   { type: "partner_left" }
  *   { type: "friend_request_received", from_username, from_nick, from_avatar }
@@ -49,6 +51,9 @@
  *   { type: "friend_offline", username }
  *   { type: "friend_busy", username }
  *   { type: "report_sent" }
+ *   { type: "profile", username, nick, avatar, banner, bio, online }
+ *   { type: "profile_not_found", username }
+ *   { type: "blocked_user", username }
  *   { type: "error", message }
  *
  * Админ-панель (обычный HTTP, отдельно от WebSocket, тот же адрес и порт):
@@ -70,6 +75,8 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || null;
 const MONGODB_URI = process.env.MONGODB_URI || null;
 
 const MAX_AVATAR_LENGTH = 300000;
+const MAX_BANNER_LENGTH = 2000000; // баннер может быть гифкой, поэтому лимит больше
+const MAX_BIO_LENGTH = 300;
 const MAX_REPORT_REASON_LENGTH = 500;
 const DATA_FILE = path.join(__dirname, "data.json");
 
@@ -260,7 +267,7 @@ const wss = new WebSocket.Server({ server: httpServer });
 
 // ---------- рантайм-состояние (не сохраняется на диск) ----------
 let queue = [];
-const clients = new Map();       // ws -> { username, nick, avatar, partner, ip }
+const clients = new Map();       // ws -> { username, nick, avatar, banner, bio, partner, ip, deviceId }
 const onlineSockets = new Map(); // username -> ws
 
 function send(ws, obj) {
@@ -274,7 +281,14 @@ function removeFromQueue(ws) {
 function publicProfile(username) {
   const u = db.users[username];
   if (!u) return null;
-  return { username, nick: u.nick, avatar: u.avatar };
+  return { username, nick: u.nick, avatar: u.avatar, banner: u.banner || null, bio: u.bio || "" };
+}
+
+function isBlocked(usernameA, usernameB) {
+  if (!usernameA || !usernameB) return false;
+  const a = db.users[usernameA];
+  const b = db.users[usernameB];
+  return !!((a && a.blocked && a.blocked.includes(usernameB)) || (b && b.blocked && b.blocked.includes(usernameA)));
 }
 
 function pairUp(wsA, wsB) {
@@ -288,20 +302,31 @@ function pairUp(wsA, wsB) {
   const areFriends =
     a.username && b.username && db.users[a.username] && db.users[a.username].friends.includes(b.username);
 
-  send(wsA, { type: "matched", partner_nick: b.nick, partner_avatar: b.avatar, partner_username: b.username, already_friends: !!areFriends });
-  send(wsB, { type: "matched", partner_nick: a.nick, partner_avatar: a.avatar, partner_username: a.username, already_friends: !!areFriends });
+  send(wsA, { type: "matched", partner_nick: b.nick, partner_avatar: b.avatar, partner_banner: b.banner || null, partner_bio: b.bio || "", partner_username: b.username, already_friends: !!areFriends });
+  send(wsB, { type: "matched", partner_nick: a.nick, partner_avatar: a.avatar, partner_banner: a.banner || null, partner_bio: a.bio || "", partner_username: a.username, already_friends: !!areFriends });
 }
 
 function findPartner(ws) {
   removeFromQueue(ws);
-  if (queue.length > 0) {
-    const partner = queue.shift();
-    if (partner.readyState !== WebSocket.OPEN) return findPartner(ws);
-    pairUp(ws, partner);
-  } else {
-    queue.push(ws);
-    send(ws, { type: "waiting" });
+  const me = clients.get(ws);
+
+  for (let i = 0; i < queue.length; i++) {
+    const candidate = queue[i];
+    if (candidate.readyState !== WebSocket.OPEN) {
+      queue.splice(i, 1);
+      i--;
+      continue;
+    }
+    const candidateMeta = clients.get(candidate);
+    if (candidateMeta && me && isBlocked(me.username, candidateMeta.username)) continue;
+
+    queue.splice(i, 1);
+    pairUp(ws, candidate);
+    return;
   }
+
+  queue.push(ws);
+  send(ws, { type: "waiting" });
 }
 
 function breakPair(ws, { requeueSelf = false } = {}) {
@@ -329,7 +354,7 @@ wss.on("connection", (ws, req) => {
     return;
   }
 
-  clients.set(ws, { username: null, nick: "Аноним", avatar: null, partner: null, ip, deviceId: null });
+  clients.set(ws, { username: null, nick: "Аноним", avatar: null, banner: null, bio: "", partner: null, ip, deviceId: null });
 
   ws.on("message", (raw) => {
     let data;
@@ -344,9 +369,15 @@ wss.on("connection", (ws, req) => {
         const token = (data.token || "").toString();
         const nick = (data.nick || "Аноним").toString().slice(0, 24);
         const deviceId = (data.deviceId || "").toString().slice(0, 100);
+        const bio = (data.bio || "").toString().slice(0, MAX_BIO_LENGTH);
+
         let avatar = null;
         if (typeof data.avatar === "string" && data.avatar.length > 0 && data.avatar.length <= MAX_AVATAR_LENGTH) {
           avatar = data.avatar;
+        }
+        let banner = null;
+        if (typeof data.banner === "string" && data.banner.length > 0 && data.banner.length <= MAX_BANNER_LENGTH) {
+          banner = data.banner;
         }
 
         if (!username) return send(ws, { type: "error", message: "Укажи юзернейм" });
@@ -367,16 +398,31 @@ wss.on("connection", (ws, req) => {
           }
           existing.nick = nick;
           existing.avatar = avatar;
+          existing.banner = banner;
+          existing.bio = bio;
           existing.lastIp = ip;
           if (deviceId) existing.lastDeviceId = deviceId;
+          if (!existing.blocked) existing.blocked = [];
         } else {
-          db.users[username] = { token: token || randomToken(), nick, avatar, friends: [], lastIp: ip, lastDeviceId: deviceId || null };
+          db.users[username] = {
+            token: token || randomToken(),
+            nick,
+            avatar,
+            banner,
+            bio,
+            friends: [],
+            blocked: [],
+            lastIp: ip,
+            lastDeviceId: deviceId || null,
+          };
         }
         saveData();
 
         me.username = username;
         me.nick = nick;
         me.avatar = avatar;
+        me.banner = banner;
+        me.bio = bio;
         me.deviceId = deviceId;
         onlineSockets.set(username, ws);
 
@@ -428,7 +474,13 @@ wss.on("connection", (ws, req) => {
         if (!me.username || !db.users[me.username]) return send(ws, { type: "friends_list", friends: [] });
         const list = db.users[me.username].friends.map((u) => {
           const profile = publicProfile(u);
-          return { username: u, nick: profile ? profile.nick : u, avatar: profile ? profile.avatar : null, online: onlineSockets.has(u) };
+          return {
+            username: u,
+            nick: profile ? profile.nick : u,
+            avatar: profile ? profile.avatar : null,
+            banner: profile ? profile.banner : null,
+            online: onlineSockets.has(u),
+          };
         });
         send(ws, { type: "friends_list", friends: list });
         break;
@@ -450,25 +502,95 @@ wss.on("connection", (ws, req) => {
       }
 
       case "report": {
-        if (!me.partner || !clients.has(me.partner)) break;
-        const partner = clients.get(me.partner);
         const reason = (data.reason || "").toString().trim().slice(0, MAX_REPORT_REASON_LENGTH);
         if (!reason) break;
+
+        let reportedUsername = (data.username || "").toString();
+        let reportedNick = null;
+        let reportedIp = null;
+        let reportedDeviceId = null;
+
+        if (reportedUsername && db.users[reportedUsername]) {
+          reportedNick = db.users[reportedUsername].nick;
+          reportedIp = db.users[reportedUsername].lastIp;
+          reportedDeviceId = db.users[reportedUsername].lastDeviceId;
+        } else if (me.partner && clients.has(me.partner)) {
+          // на случай старого клиента: жалоба без явного username — на текущего партнёра
+          const partner = clients.get(me.partner);
+          reportedUsername = partner.username || "(без юзернейма)";
+          reportedNick = partner.nick;
+          reportedIp = partner.ip;
+          reportedDeviceId = partner.deviceId;
+        } else {
+          break;
+        }
 
         db.reports.push({
           id: randomId(),
           reporterUsername: me.username || "(без юзернейма)",
           reporterNick: me.nick,
-          reportedUsername: partner.username || "(без юзернейма)",
-          reportedNick: partner.nick,
-          reportedIp: partner.ip,
-          reportedDeviceId: partner.deviceId || null,
+          reportedUsername,
+          reportedNick,
+          reportedIp,
+          reportedDeviceId,
           reason,
           createdAt: Date.now(),
           resolved: false,
         });
         saveData();
         send(ws, { type: "report_sent" });
+        break;
+      }
+
+      case "get_profile": {
+        const targetUsername = (data.username || "").toString();
+        const target = db.users[targetUsername];
+
+        if (!target) {
+          send(ws, { type: "profile_not_found", username: targetUsername });
+          break;
+        }
+
+        const already_friends = !!(me.username && db.users[me.username] && db.users[me.username].friends.includes(targetUsername));
+
+        send(ws, {
+          type: "profile",
+          username: targetUsername,
+          nick: target.nick,
+          avatar: target.avatar,
+          banner: target.banner || null,
+          bio: target.bio || "",
+          online: onlineSockets.has(targetUsername),
+          already_friends,
+        });
+        break;
+      }
+
+      case "block_user": {
+        const targetUsername = (data.username || "").toString();
+        if (!me.username || !targetUsername || targetUsername === me.username || !db.users[me.username]) break;
+
+        if (!db.users[me.username].blocked) db.users[me.username].blocked = [];
+        if (!db.users[me.username].blocked.includes(targetUsername)) {
+          db.users[me.username].blocked.push(targetUsername);
+        }
+
+        // блокировка автоматически разрывает дружбу в обе стороны
+        db.users[me.username].friends = db.users[me.username].friends.filter((u) => u !== targetUsername);
+        if (db.users[targetUsername]) {
+          db.users[targetUsername].friends = db.users[targetUsername].friends.filter((u) => u !== me.username);
+        }
+        saveData();
+
+        // если это текущий собеседник — разрываем пару и ищем нового
+        if (me.partner) {
+          const partnerMeta = clients.get(me.partner);
+          if (partnerMeta && partnerMeta.username === targetUsername) {
+            breakPair(ws, { requeueSelf: true });
+          }
+        }
+
+        send(ws, { type: "blocked_user", username: targetUsername });
         break;
       }
 
