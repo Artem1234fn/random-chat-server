@@ -75,7 +75,7 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || null;
 const MONGODB_URI = process.env.MONGODB_URI || null;
 
 const MAX_AVATAR_LENGTH = 300000;
-const MAX_BANNER_LENGTH = 2000000; // баннер может быть гифкой, поэтому лимит больше
+const MAX_BANNER_LENGTH = 14000000; // ~10 МБ файла раздувается в base64 примерно на треть
 const MAX_BIO_LENGTH = 300;
 const MAX_REPORT_REASON_LENGTH = 500;
 const DATA_FILE = path.join(__dirname, "data.json");
