@@ -260,6 +260,53 @@ const httpServer = http.createServer(async (req, res) => {
     return sendJson(res, 200, { ok: true });
   }
 
+  if (url.pathname === "/admin/accounts" && req.method === "GET") {
+    if (url.searchParams.get("password") !== ADMIN_PASSWORD) {
+      return sendJson(res, 401, { error: "Неверный пароль" });
+    }
+    const accounts = Object.keys(db.users)
+      .sort()
+      .map((username) => {
+        const u = db.users[username];
+        return {
+          username,
+          nick: u.nick,
+          avatar: u.avatar,
+          online: onlineSockets.has(username),
+          banned: !!db.bannedUsernames[username],
+          friendsCount: (u.friends || []).length,
+        };
+      });
+    return sendJson(res, 200, { accounts });
+  }
+
+  if (url.pathname === "/admin/delete_account" && req.method === "POST") {
+    const body = await readJsonBody(req);
+    if (body.password !== ADMIN_PASSWORD) return sendJson(res, 401, { error: "Неверный пароль" });
+
+    const username = (body.username || "").toString();
+    if (!username || !db.users[username]) return sendJson(res, 404, { error: "Пользователь не найден" });
+
+    // выгоняем, если сейчас онлайн
+    const targetWs = onlineSockets.get(username);
+    if (targetWs) {
+      send(targetWs, { type: "account_deleted" });
+      targetWs.close();
+      onlineSockets.delete(username);
+    }
+
+    // убираем из чужих списков друзей
+    Object.values(db.users).forEach((u) => {
+      if (Array.isArray(u.friends)) {
+        u.friends = u.friends.filter((f) => f !== username);
+      }
+    });
+
+    delete db.users[username];
+    saveData();
+    return sendJson(res, 200, { ok: true });
+  }
+
   sendJson(res, 404, { error: "Не найдено" });
 });
 
